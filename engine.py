@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Dict, List, Optional
 from google import genai
 from google.genai import types
@@ -38,6 +39,10 @@ class SurchargeRules(BaseModel):
         default=1.0,
         description="نسبة تكلفة الشحنة المرتجعة مقارنة بالسعر الأساسي",
     )
+    rto_is_addon: bool = Field(
+        default=True,
+        description="هل رسوم المرتجع تضاف فوق السعر الأساسي أم كنسبة منه فقط",
+    )
 
 
 class ContractRules(BaseModel):
@@ -55,6 +60,19 @@ class ContractRules(BaseModel):
     volumetric_divisor: float = Field(
         default=5000.0, description="معامل الوزن الحجمي (5000 أو 6000 أو custom)"
     )
+    weight_unit: str = Field(
+        default="kg", description="وحدة الوزن العقدية (kg أو lbs)"
+    )
+    dim_unit: str = Field(
+        default="cm", description="وحدة الأبعاد العقدية (cm أو inches)"
+    )
+    weight_rounding_increment: float = Field(
+        default=0.5,
+        description="خطوة تقريب الوزن للأعلى (مثلاً 0.5 كجم أو 1.0 كجم)",
+    )
+    min_overcharge_threshold: float = Field(
+        default=0.5, description="الحد الأدنى لفرق السعر للمطالبة به"
+    )
     city_zone_matrix: Dict[str, str] = Field(
         default_factory=dict,
         description="مصفوفة تطابق المدن/الرموز البريدية مع المناطق",
@@ -64,28 +82,66 @@ class ContractRules(BaseModel):
 
 
 # ==========================================
-# 2. تنظيف وتحويل البيانات
+# 2. تنظيف وتحويل البيانات الذكي
 # ==========================================
 
 
-def safe_numeric_conversion(series: pd.Series, default_val: float = 0.0) -> pd.Series:
-    cleaned = (
-        series.astype(str)
-        .str.replace(r"[^\d.]", "", regex=True)
-        .replace("", str(default_val))
-    )
-    return pd.to_numeric(cleaned, errors="coerce").fillna(default_val)
+def safe_numeric_conversion(
+    series: pd.Series, default_val: float = 0.0
+) -> pd.Series:
+    """تنظيف ذكي يعالج الفواصل العشرية الأوروبية والعربية والعلامات الخاصة"""
+
+    def clean_val(val):
+        if pd.isna(val):
+            return default_val
+        s = str(val).strip()
+        if "," in s and "." in s:
+            s = s.replace(",", "")
+        elif "," in s and "." not in s:
+            s = s.replace(",", ".")
+        s = re.sub(r"[^\d.]", "", s)
+        try:
+            return float(s) if s != "" else default_val
+        except ValueError:
+            return default_val
+
+    return series.apply(clean_val)
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """مطابقة محكمة لأسماء الأعمدة تضمن عدم التداخل بين المبالغ والمستحقات"""
     col_map = {}
     for col in df.columns:
         c_lower = str(col).strip().lower()
+
+        # أولوية المطابقة
         if any(
             k in c_lower
-            for k in ["tracking", "شحنة", "awb", "waybill", "conshipment", "barcode"]
+            for k in [
+                "tracking",
+                "شحنة",
+                "awb",
+                "waybill",
+                "conshipment",
+                "barcode",
+            ]
         ):
             col_map[col] = "tracking_id"
+        elif any(
+            k in c_lower for k in ["cod", "دفع عند الاستلام", "cash_on_delivery"]
+        ):
+            col_map[col] = "cod_amount"
+        elif any(
+            k in c_lower
+            for k in [
+                "billed",
+                "المبلغ المفلتر",
+                "المبلغ بالفاتورة",
+                "total_charge",
+                "amount_billed",
+            ]
+        ):
+            col_map[col] = "billed_amount"
         elif any(
             k in c_lower
             for k in ["actual_weight", "وزن", "weight", "net_weight", "gross_weight"]
@@ -98,11 +154,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         elif any(k in c_lower for k in ["height", "ارتفاع", "h_cm"]):
             col_map[col] = "height_cm"
         elif any(
-            k in c_lower
-            for k in ["billed", "المبلغ", "amount", "charge", "total_fee", "cost"]
-        ):
-            col_map[col] = "billed_amount"
-        elif any(
             k in c_lower for k in ["zone", "منطقة", "region", "destination_zone"]
         ):
             col_map[col] = "zone_id"
@@ -110,16 +161,15 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             k in c_lower for k in ["destination", "المدينة", "city", "postal", "zip"]
         ):
             col_map[col] = "destination_city"
-        elif any(
-            k in c_lower for k in ["cod", "دفع عند الاستلام", "cash_on_delivery"]
-        ):
-            col_map[col] = "cod_amount"
         elif any(k in c_lower for k in ["remote", "نائية", "out_of_delivery"]):
             col_map[col] = "is_remote"
         elif any(
             k in c_lower for k in ["status", "حالة", "rto", "delivered", "returned"]
         ):
             col_map[col] = "shipment_status"
+        elif "amount" in c_lower or "cost" in c_lower or "المبلغ" in c_lower:
+            if "billed_amount" not in col_map.values():
+                col_map[col] = "billed_amount"
 
     df = df.rename(columns=col_map)
 
@@ -160,7 +210,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==========================================
-# 3. ميزة المسح الأولي واستخراج ملف التوضيحات للعميل
+# 3. الفحص المسبق السريع قبل المعالجة
 # ==========================================
 
 
@@ -169,9 +219,14 @@ def scan_and_generate_validation_file(
     rules: ContractRules,
     validation_output_path: str = "Need_User_Verification.xlsx",
 ) -> bool:
-    """فحص الفاتورة قبل المعالجة وتوليد ملف إكسل بالتوضيحات المطلوبة إن وجدت"""
+    """فحص سريع ومعدل الأداء للكشف عن البيانات المبهمة"""
     df = normalize_columns(invoice_df.copy())
-    valid_zones = [r.zone_id.strip().lower() for r in rules.rates]
+    valid_zones = {r.zone_id.strip().lower() for r in rules.rates}
+    matrix_cities = (
+        {k.lower() for k in rules.city_zone_matrix.keys()}
+        if rules.city_zone_matrix
+        else set()
+    )
 
     issues = []
 
@@ -186,11 +241,7 @@ def scan_and_generate_validation_file(
         if zone not in valid_zones and zone != "default":
             reason.append(f"المنطقة '{row['zone_id']}' غير معرفة بجدول العقد.")
 
-        if (
-            rules.city_zone_matrix
-            and city
-            and city not in [k.lower() for k in rules.city_zone_matrix.keys()]
-        ):
+        if matrix_cities and city and city not in matrix_cities:
             reason.append(f"المدينة '{row['destination_city']}' غير مسجلة بالماتريكس.")
 
         if billed <= 0:
@@ -211,11 +262,6 @@ def scan_and_generate_validation_file(
     if issues:
         issues_df = pd.DataFrame(issues)
         issues_df.to_excel(validation_output_path, index=False)
-        print("\n" + "⚠️ " * 15)
-        print("🛑 [توقف مؤقت]: تم العثور على بيانات مبهمة تحتاج لتوضيح العميل.")
-        print(f"📁 تم حفظ ملف التوضيحات المطلوب تعبئته في: {validation_output_path}")
-        print("👉 يرجى مراجعة الملف وتحديد المناطق الصحيحة ثم إعادة تشغيل التدقيق.")
-        print("⚠️ " * 15 + "\n")
         return True
 
     return False
@@ -232,18 +278,18 @@ def extract_rules_from_contract(
     if not os.path.exists(contract_pdf_path):
         raise FileNotFoundError(f"❌ لم يتم العثور على العقد: {contract_pdf_path}")
 
-    print("📜 [Verilogix AI Global Engine] جاري تحليل العقد وقراءة القواعد...")
     contract_file = client.files.upload(file=contract_pdf_path)
 
     prompt = """
     You are an expert global logistics auditor for Verilogix AI. Analyze the shipping contract and extract:
-    1. Carrier Name and Currency (USD, EUR, SAR, etc.).
+    1. Carrier Name and Currency (USD, EUR, SAR, AED, etc.).
     2. VAT / Tax Percentage.
     3. Fuel Surcharge Percentage.
-    4. Volumetric Weight Divisor (e.g. 5000, 6000).
-    5. City/Postal Code to Zone Mapping Matrix if present.
-    6. All Rate Zones (Max Weight, Base Price, Extra KG Price).
-    7. Surcharges: COD %, Minimum COD fee, Remote Area fee, and Return to Origin (RTO) fee percentage.
+    4. Volumetric Weight Divisor (e.g. 5000, 6000) and Units (kg/lbs, cm/inches).
+    5. Weight Rounding Increment (e.g., 0.5 kg or 1.0 kg rounding steps).
+    6. City/Postal Code to Zone Mapping Matrix if present.
+    7. All Rate Zones (Max Weight, Base Price, Extra KG Price).
+    8. Surcharges: COD %, Minimum COD fee, Remote Area fee, and Return to Origin (RTO) fee percentage & whether RTO is an add-on fee.
     """
 
     try:
@@ -268,84 +314,59 @@ def extract_rules_from_contract(
 
 
 # ==========================================
-# 5. عرض الشروط واستلام التوافق من العميل
-# ==========================================
-
-
-def confirm_contract_rules_with_user(rules: ContractRules) -> bool:
-    """عرض الشروط المستخرجة من العقد واشتراط موافقة المستخدم قبل التدقيق"""
-    print("\n" + "=" * 60)
-    print("📜 [Verilogix AI] الشروط والقواعد المعتمدة المستخرجة من العقد:")
-    print("=" * 60)
-    print(f"🏢 شركة الشحن: {rules.carrier_name}")
-    print(f"💰 العملة المعتمدة: {rules.currency}")
-    print(f"٪ ضريبة القيمة المضافة (VAT): {rules.vat_percentage * 100}%")
-    print(f"⛽ رسوم الوقود: {rules.fuel_surcharge_percentage * 100}%")
-    print(f"📦 معامل الوزن الحجمي: {rules.volumetric_divisor}")
-    print("\n📊 الشرائح السعرية والمناطق:")
-    for rate in rules.rates:
-        print(
-            f"   - المنطقة: {rate.zone_id:<12} | حد الوزن: {rate.max_weight_kg} كجم | السعر: {rate.base_price} {rules.currency} (الكيلو الإضافي: {rate.extra_kg_price})"
-        )
-
-    print("\n💳 الرسوم الإضافية (Surcharges):")
-    print(
-        f"   - نسبة COD: {rules.surcharges.cod_fee_percentage * 100}% (الحد الأدنى: {rules.surcharges.cod_min_fee} {rules.currency})"
-    )
-    print(
-        f"   - رسوم المناطق النائية: {rules.surcharges.remote_area_fee} {rules.currency}"
-    )
-    print(
-        f"   - نسبة الشحنات المرتجعة RTO: {rules.surcharges.rto_fee_percentage * 100}%"
-    )
-    print("=" * 60 + "\n")
-
-    user_input = (
-        input(
-            "❓ هل تؤكد صحة هذه البيانات للبدء في تدقيق الفاتورة؟ (اكتب 'yes' للبدء / أو 'no' للتعديل): "
-        )
-        .strip()
-        .lower()
-    )
-
-    return user_input in ["yes", "y", "نعم"]
-
-
-# ==========================================
-# 6. المحرك الحسابي والتدقيق الشامل
+# 5. المحرك الحسابي والتدقيق الفائق المعدل
 # ==========================================
 
 
 def audit_invoice_dataframe_fast(
     invoice_df: pd.DataFrame, rules: ContractRules
 ) -> pd.DataFrame:
-    print("⚡ [Verilogix AI] جاري تنفيذ التدقيق الحسابي واللوجستي الفائق...")
-
     df = normalize_columns(invoice_df.copy())
+
+    # أ) تحويل الوحدات القياسية إن وجدت (LBS / INCHES)
+    if rules.weight_unit.lower() in ["lb", "lbs", "pound", "باوند"]:
+        df["actual_weight_kg"] = df["actual_weight"] * 0.453592
+    else:
+        df["actual_weight_kg"] = df["actual_weight"]
+
+    if rules.dim_unit.lower() in ["in", "inch", "inches", "إنش", "بوصة"]:
+        df["length_cm"] = df["length_cm"] * 2.54
+        df["width_cm"] = df["width_cm"] * 2.54
+        df["height_cm"] = df["height_cm"] * 2.54
+
+    # ب) تصحيح حساب الوزن الحجمي للشحنات متعددة الطرود (MPS)
+    vol_divisor = (
+        rules.volumetric_divisor if rules.volumetric_divisor > 0 else 5000.0
+    )
+    df["piece_volumetric_weight_kg"] = (
+        df["length_cm"] * df["width_cm"] * df["height_cm"]
+    ) / vol_divisor
+
+    # تجميع الأحجام والأوزان بدقة لكل رقم شحنة
+    grouped = df.groupby("tracking_id")[
+        ["actual_weight_kg", "piece_volumetric_weight_kg"]
+    ].transform("sum")
+    df["total_actual_weight_kg"] = grouped["actual_weight_kg"]
+    df["total_volumetric_weight_kg"] = grouped["piece_volumetric_weight_kg"]
 
     df["has_zero_dims"] = (
         (df["length_cm"] == 0) & (df["width_cm"] == 0) & (df["height_cm"] == 0)
     )
-    grouped_weights = df.groupby("tracking_id")[
-        ["actual_weight", "length_cm", "width_cm", "height_cm"]
-    ].transform("sum")
-    df["actual_weight"] = np.where(
-        df.duplicated("tracking_id", keep=False),
-        grouped_weights["actual_weight"],
-        df["actual_weight"],
-    )
 
+    # كشف تكرارات الفاتورة الخاطئة
     df["is_duplicate"] = df.duplicated(
         subset=["tracking_id", "billed_amount"], keep="first"
     ) & ~df["tracking_id"].astype(str).str.startswith("UNKNOWN_")
 
+    # ج) مطابقة المناطق والمدن
     if rules.city_zone_matrix:
+        matrix_lower = {k.lower(): v for k, v in rules.city_zone_matrix.items()}
         mapped_zones = (
             df["destination_city"]
             .astype(str)
             .str.strip()
             .str.lower()
-            .map({k.lower(): v for k, v in rules.city_zone_matrix.items()})
+            .map(matrix_lower)
         )
         df["verified_zone"] = mapped_zones.fillna(df["zone_id"])
         df["zone_mismatch"] = (
@@ -356,16 +377,20 @@ def audit_invoice_dataframe_fast(
         df["verified_zone"] = df["zone_id"]
         df["zone_mismatch"] = False
 
-    vol_divisor = (
-        rules.volumetric_divisor if rules.volumetric_divisor > 0 else 5000.0
-    )
-    df["volumetric_weight"] = (
-        df["length_cm"] * df["width_cm"] * df["height_cm"]
-    ) / vol_divisor
-    df["chargeable_weight"] = df[["actual_weight", "volumetric_weight"]].max(
-        axis=1
-    )
+    # د) حساب الوزن الخاضع للرسوم مع تطبيق خطوة التقريب للأعلى (Weight Rounding)
+    df["raw_chargeable_weight"] = df[
+        ["total_actual_weight_kg", "total_volumetric_weight_kg"]
+    ].max(axis=1)
 
+    if rules.weight_rounding_increment > 0:
+        inc = rules.weight_rounding_increment
+        df["chargeable_weight"] = (
+            np.ceil(df["raw_chargeable_weight"] / inc) * inc
+        )
+    else:
+        df["chargeable_weight"] = df["raw_chargeable_weight"]
+
+    # هـ) مطابقة الأسعار بناءً على الشرائح
     rates_data = [
         {
             "zone_id": r.zone_id.strip().lower(),
@@ -410,18 +435,29 @@ def audit_invoice_dataframe_fast(
 
     df["expected_base_price"] = prices
 
+    # و) احتساب رسوم المرتجع (RTO)
     is_rto = (
         df["shipment_status"]
         .astype(str)
         .str.lower()
         .isin(["rto", "returned", "مرتجعة", "مرتجع"])
     )
-    df["expected_base_price"] = np.where(
-        is_rto,
-        df["expected_base_price"] * rules.surcharges.rto_fee_percentage,
-        df["expected_base_price"],
-    )
 
+    if rules.surcharges.rto_is_addon:
+        df["expected_base_price"] = np.where(
+            is_rto,
+            df["expected_base_price"]
+            * (1.0 + rules.surcharges.rto_fee_percentage),
+            df["expected_base_price"],
+        )
+    else:
+        df["expected_base_price"] = np.where(
+            is_rto,
+            df["expected_base_price"] * rules.surcharges.rto_fee_percentage,
+            df["expected_base_price"],
+        )
+
+    # ز) احتساب باقي الرسوم والضريبة
     df["expected_fuel_fee"] = (
         df["expected_base_price"] * rules.fuel_surcharge_percentage
     )
@@ -448,8 +484,15 @@ def audit_invoice_dataframe_fast(
 
     df["overcharge"] = (df["billed_amount"] - df["expected_total"]).round(2)
 
+    # ح) فلترة المخالفات بناءً على الحد المعتمد للعملة
+    min_thresh = (
+        rules.min_overcharge_threshold
+        if rules.min_overcharge_threshold > 0
+        else 0.1
+    )
+
     flagged = df[
-        (df["overcharge"] > 0.5)
+        (df["overcharge"] >= min_thresh)
         | (df["is_duplicate"])
         | (df["zone_mismatch"])
         | (df["has_zero_dims"])
@@ -465,9 +508,9 @@ def audit_invoice_dataframe_fast(
             )
         if row["has_zero_dims"]:
             evidence_list.append(
-                "تنبيه: أبعاد الشحنة مفقودة (0x0x0)، تم الاحتساب بناءً على الوزن الفعلي فقط."
+                "تنبيه: أبعاد الشحنة مفقودة، تم الاحتساب بناءً على الوزن الفعلي فقط."
             )
-        if row["overcharge"] > 0.5:
+        if row["overcharge"] >= min_thresh:
             evidence_list.append(
                 f"فروقات مالية: المفلتر بالفاتورة {row['billed_amount']} {rules.currency} | المستحق بالعقد {row['expected_total']} {rules.currency}. "
                 f"المطالبة باسترداد: {row['overcharge']} {rules.currency}."
@@ -479,8 +522,8 @@ def audit_invoice_dataframe_fast(
     return flagged[
         [
             "tracking_id",
-            "actual_weight",
-            "volumetric_weight",
+            "total_actual_weight_kg",
+            "total_volumetric_weight_kg",
             "chargeable_weight",
             "billed_amount",
             "expected_total",
@@ -488,85 +531,4 @@ def audit_invoice_dataframe_fast(
             "dispute_evidence",
         ]
     ]
-
-
-# ==========================================
-# 7. خط التشغيل الرئيسي مع التوقف والتأكيد
-# ==========================================
-
-
-def run_verilogix_global_pipeline(
-    contract_pdf_path: str,
-    invoice_file_path: str,
-    output_report_path: str = "Verilogix_Global_Audit_Report.xlsx",
-    rules_json_path: str = "contract_rules.json",
-):
-    if os.path.exists(rules_json_path):
-        print(
-            f"📂 [Verilogix] تحميل قواعد العقد المعتمدة ({rules_json_path})..."
-        )
-        with open(rules_json_path, "r", encoding="utf-8") as f:
-            rules = ContractRules(**json.load(f))
-    else:
-        rules = extract_rules_from_contract(contract_pdf_path, rules_json_path)
-
-    # توقف واشتراط تأكيد المستخدم أولاً
-    is_confirmed = confirm_contract_rules_with_user(rules)
-
-    if not is_confirmed:
-        print("\n🛑 [تم إيقاف العملية]: لم يتم تأكيد قواعد العقد.")
-        print(
-            f"👉 يمكنك مراجعة وتعديل الملف '{rules_json_path}' يدوياً ثم إعادة تشغيل الكود.\n"
-        )
-        return
-
-    print("\n🚀 تم التأكيد! جاري البدء بتدقيق الفاتورة الآن...\n")
-
-    ext = os.path.splitext(invoice_file_path)[-1].lower()
-    if ext == ".csv":
-        invoice_df = pd.read_csv(invoice_file_path)
-    else:
-        invoice_df = pd.read_excel(invoice_file_path)
-
-    has_issues = scan_and_generate_validation_file(
-        invoice_df, rules, validation_output_path="Need_User_Verification.xlsx"
-    )
-
-    if has_issues:
-        return
-
-    flagged_df = audit_invoice_dataframe_fast(invoice_df, rules)
-
-    if flagged_df.empty:
-        print("✅ جميع الشحنات مطابقة للعقد والأسعار تماماً دون وجود أي مخالفات!")
-        return
-
-    excel_df = flagged_df.rename(
-        columns={
-            "tracking_id": "رقم الشحنة",
-            "actual_weight": "الوزن الفعلي",
-            "volumetric_weight": "الوزن الحجمي",
-            "chargeable_weight": "الوزن المحسوب",
-            "billed_amount": f"المبلغ بالفاتورة ({rules.currency})",
-            "expected_total": f"المبلغ المستحق ({rules.currency})",
-            "overcharge": f"الزيادة المستردة ({rules.currency})",
-            "dispute_evidence": "تقرير النزاع التلقائي",
-        }
-    )
-
-    excel_df.to_excel(output_report_path, index=False)
-    total_recovered = excel_df[f"الزيادة المستردة ({rules.currency})"].sum()
-
-    print("\n" + "=" * 60)
-    print("🌍 تم التدقيق اللوجستي بنجاح بواسطة Verilogix AI Engine!")
-    print(f"🏢 شركة الشحن: {rules.carrier_name}")
-    print(f"📊 إجمالي المخالفات المكتشفة: {len(excel_df)}")
-    print(
-        f"💰 إجمالي المبالغ القابلة للاسترداد: {total_recovered:,.2f} {rules.currency}"
-    )
-    print(f"📁 تم حفظ التقرير الشامل في: {output_report_path}")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    pass
+    
