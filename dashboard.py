@@ -3,9 +3,11 @@ import os
 import pandas as pd
 import streamlit as st
 
-# استدعاء المحرك الرئيسي (تأكد من وجود ملف نظام_بدون_مفتاح_V0_1.py في نفس المجلد)
+# استدعاء المحرك الرئيسي المتطور
 from engine import (
     ContractRules,
+    RateZone,
+    SurchargeRules,
     audit_invoice_dataframe_fast,
     extract_rules_from_contract,
     scan_and_generate_validation_file,
@@ -13,33 +15,41 @@ from engine import (
 
 # 1. إعدادات الواجهة والنسق البصري
 st.set_page_config(
-    page_title="Verilogix AI | Audit Platform",
+    page_title="Verilogix AI | Admin Control Panel",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# شريط جانبي احترافي
+# 2. الشريط الجانبي لتنظيم العملاء والبيئة
 with st.sidebar:
     st.image(
-        "https://img.icons8.com/color/96/delivery-conveyer.png", width=80
+        "https://img.icons8.com/color/96/delivery-conveyer.png", width=70
     )
-    st.title("Verilogix AI Engine")
-    st.caption("منصة التدقيق الذاتي للفواتير والعقود اللوجستية")
+    st.title("Verilogix Admin Engine")
+    st.caption("منصة التدقيق اللوجستي المتقدمة")
     st.divider()
-    st.write("👤 **المستخدم:** زين عثمان")
-    st.write("🌐 **البيئة:** Cloud Production")
+
+    client_name = st.text_input(
+        "🏢 اسم العميل / المشروع",
+        value="Default_Client",
+        help="تستعمل لإنشاء مجلد حفظ خاص ببيانات العميل",
+    )
+    st.write("👤 **المسؤول:** زين عثمان")
+    st.write("🌐 **البيئة:** Universal Production")
+    st.divider()
 
 st.title("📦 Verilogix AI | لوحة التحكم والتفتيش اللوجستي")
 st.write(
-    "أهلاً بك زين! ارفع عقد الشحن وفاتورة الشحنات للبدء في تحليل الفروقات المالية واسترداد المبالغ."
+    f"أهلاً بك زين! ارفع عقد الشحن وفاتورة الشحنات للبدء في تحليل الفروقات المالية لصالح العميل: **{client_name}**."
 )
 st.divider()
 
-UPLOAD_DIR = "server_uploads"
+# مجلد حفظ مخصص للعميل
+UPLOAD_DIR = os.path.join("server_uploads", client_name)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# 2. قسم رفع المستندات
+# 3. قسم رفع المستندات
 st.subheader("1️⃣ رفع المستندات المرجعية")
 col_up1, col_up2 = st.columns(2)
 
@@ -57,11 +67,12 @@ with col_up2:
 
 st.divider()
 
-# 3. مرحلة استخراج القواعد والتأكيد المسبق
+# 4. مرحلة استخراج البيانات والمراجعة التفاعلية قبل التدقيق
 if contract_file and invoice_file:
     contract_path = os.path.join(UPLOAD_DIR, contract_file.name)
     invoice_path = os.path.join(UPLOAD_DIR, invoice_file.name)
 
+    # حفظ الملفات المرفوعة
     with open(contract_path, "wb") as f:
         f.write(contract_file.getbuffer())
     with open(invoice_path, "wb") as f:
@@ -71,64 +82,220 @@ if contract_file and invoice_file:
         UPLOAD_DIR, f"{contract_file.name}_rules.json"
     )
 
-    # قراءة أو استخراج قواعد العقد بـ Gemini
-    if "contract_rules" not in st.session_state:
+    # استخراج قواعد العقد بـ Gemini عند الرفع لأول مرة
+    if (
+        "contract_rules" not in st.session_state
+        or st.session_state.get("current_contract") != contract_file.name
+    ):
         if os.path.exists(rules_json_path):
             with open(rules_json_path, "r", encoding="utf-8") as f:
                 st.session_state.contract_rules = ContractRules(**json.load(f))
         else:
-            with st.spinner("📜 [Gemini AI] جاري تفكيك ملف العقد واستخراج المصفوفات المالية..."):
+            with st.spinner("📜 [Gemini AI] جاري قراءة العقد واستخراج المصفوفات المالية..."):
                 st.session_state.contract_rules = extract_rules_from_contract(
                     contract_path, rules_json_path
                 )
+        st.session_state.current_contract = contract_file.name
 
-    rules = st.session_state.contract_rules
+    rules: ContractRules = st.session_state.contract_rules
 
-    # عرض ملخص القواعد للتأكيد قبل المعالجة
-    st.subheader("2️⃣ مراجعة وتأكيد قواعد العقد (Pre-Audit Approval)")
-    st.warning("⚠️ يُرجى مراجعة وتأكيد القواعد التي تم استخراجها من العقد قبل بدء تدقيق الفاتورة:")
+    # ==========================================
+    # قسم المراجعة والتعديل المباشر (Editable Form)
+    # ==========================================
+    st.subheader("2️⃣ مراجعة وتعديل قواعد العقد قبل التدقيق (Pre-Audit Control)")
+    st.info(
+        "💡 يمكنك مراجعة البيانات التي استخرجها النظام وتعديل أي قيمة قبل بدء معالجة الفاتورة:"
+    )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("شركة الشحن", rules.carrier_name)
-    m2.metric("العملة", rules.currency)
-    m3.metric("نسبة الضريبة (VAT)", f"{rules.vat_percentage * 100}%")
-    m4.metric("رسوم الوقود", f"{rules.fuel_surcharge_percentage * 100}%")
+    with st.form("contract_rules_form"):
+        # أ) الشروط الأساسية والعملات
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            carrier_name = st.text_input("شركة الشحن", rules.carrier_name)
+            currency = st.text_input("العملة المعتمدة", rules.currency)
+        with col2:
+            vat_pct = (
+                st.number_input(
+                    "نسبة الضريبة VAT %",
+                    value=float(rules.vat_percentage * 100),
+                    step=0.5,
+                )
+                / 100.0
+            )
+            fuel_pct = (
+                st.number_input(
+                    "نسبة رسوم الوقود %",
+                    value=float(rules.fuel_surcharge_percentage * 100),
+                    step=0.5,
+                )
+                / 100.0
+            )
+        with col3:
+            vol_div = st.number_input(
+                "معامل الوزن الحجمي",
+                value=float(rules.volumetric_divisor),
+                step=100.0,
+            )
+            round_inc = st.number_input(
+                "خطوة تقريب الوزن (كجم)",
+                value=float(rules.weight_rounding_increment),
+                step=0.1,
+            )
+        with col4:
+            weight_unit = st.selectbox(
+                "وحدة الوزن",
+                ["kg", "lbs"],
+                index=0 if rules.weight_unit.lower() == "kg" else 1,
+            )
+            min_thresh = st.number_input(
+                "حد المطالبة الأدنى",
+                value=float(rules.min_overcharge_threshold),
+                step=0.1,
+            )
 
-    with st.expander("🔍 استعراض تفاصيل الشرائح السعرية والرسوم الإضافية", expanded=True):
-        st.write("**جدول أسعار المناطق (Rate Cards):**")
-        rates_list = [
+        st.divider()
+
+        # ب) الرسوم الإضافية (Surcharges)
+        st.write("💳 **الرسوم الإضافية وشرط المرتجعات:**")
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        with sc1:
+            cod_pct = (
+                st.number_input(
+                    "نسبة COD %",
+                    value=float(rules.surcharges.cod_fee_percentage * 100),
+                    step=0.5,
+                )
+                / 100.0
+            )
+        with sc2:
+            cod_min = st.number_input(
+                "الحد الأدنى لرسوم COD",
+                value=float(rules.surcharges.cod_min_fee),
+                step=1.0,
+            )
+        with sc3:
+            remote_fee = st.number_input(
+                "رسوم المناطق النائية",
+                value=float(rules.surcharges.remote_area_fee),
+                step=1.0,
+            )
+        with sc4:
+            rto_pct = (
+                st.number_input(
+                    "نسبة المرتجع RTO %",
+                    value=float(rules.surcharges.rto_fee_percentage * 100),
+                    step=5.0,
+                )
+                / 100.0
+            )
+            rto_addon = st.checkbox(
+                "رسوم المرتجع إضافية فوق السعر الأساسي",
+                value=rules.surcharges.rto_is_addon,
+            )
+
+        st.divider()
+
+        # ج) جدول الشرائح السعرية والمناطق القابل للتعديل المباشر
+        st.write("📊 **شرائح الأسعار والمناطق (Rate Cards):**")
+        rates_data = [
             {
-                "رمز المنطقة": r.zone_id,
-                "الوزن الأقصى (كجم)": r.max_weight_kg,
-                "السعر الأساسي": f"{r.base_price} {rules.currency}",
-                "سعر الكيلو الإضافي": f"{r.extra_kg_price} {rules.currency}",
+                "zone_id": r.zone_id,
+                "max_weight_kg": r.max_weight_kg,
+                "base_price": r.base_price,
+                "extra_kg_price": r.extra_kg_price,
             }
             for r in rules.rates
         ]
-        st.dataframe(pd.DataFrame(rates_list), use_container_width=True)
+        rates_df = pd.DataFrame(rates_data)
 
-        st.write("**شروط الرسوم الإضافية (Surcharges):**")
-        st.write(f"- **نسبة COD:** {rules.surcharges.cod_fee_percentage * 100}% (بحد أدنى: {rules.surcharges.cod_min_fee} {rules.currency})")
-        st.write(f"- **رسوم المناطق النائية:** {rules.surcharges.remote_area_fee} {rules.currency}")
-        st.write(f"- **نسبة تكلفة المرتجعات (RTO):** {rules.surcharges.rto_fee_percentage * 100}%")
+        edited_rates_df = st.data_editor(
+            rates_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "zone_id": "رمز المنطقة",
+                "max_weight_kg": "الوزن الأقصى (كجم)",
+                "base_price": f"السعر الأساسي ({currency})",
+                "extra_kg_price": f"الكيلو الإضافي ({currency})",
+            },
+        )
+
+        save_rules_btn = st.form_submit_button(
+            "💾 حفظ وتحديث القواعد المعتمدة"
+        )
+
+        # تحديث كائن القواعد عند الضغط على زر الحفظ داخل النموذج
+        if save_rules_btn:
+            new_rates = [
+                RateZone(
+                    zone_id=row["zone_id"],
+                    max_weight_kg=float(row["max_weight_kg"]),
+                    base_price=float(row["base_price"]),
+                    extra_kg_price=float(row["extra_kg_price"]),
+                )
+                for _, row in edited_rates_df.iterrows()
+            ]
+
+            st.session_state.contract_rules = ContractRules(
+                carrier_name=carrier_name,
+                currency=currency,
+                vat_percentage=vat_pct,
+                fuel_surcharge_percentage=fuel_pct,
+                volumetric_divisor=vol_div,
+                weight_unit=weight_unit,
+                weight_rounding_increment=round_inc,
+                min_overcharge_threshold=min_thresh,
+                city_zone_matrix=rules.city_zone_matrix,
+                rates=new_rates,
+                surcharges=SurchargeRules(
+                    cod_fee_percentage=cod_pct,
+                    cod_min_fee=cod_min,
+                    remote_area_fee=remote_fee,
+                    rto_fee_percentage=rto_pct,
+                    rto_is_addon=rto_addon,
+                ),
+            )
+
+            # حفظ القواعد المعدلة في JSON العميل
+            with open(rules_json_path, "w", encoding="utf-8") as f:
+                f.write(
+                    st.session_state.contract_rules.model_dump_json(indent=4)
+                )
+
+            st.success("✅ تم تحديث قواعد العقد بنجاح!")
+            st.rerun()
 
     st.divider()
 
-    # 4. زر التنفيذ بعد التأكيد
-    st.subheader("3️⃣ تشغيل التدقيق الحسابي واللوجستي")
+    # 5. تشغيل التدقيق الحسابي بعد التأكيد
+    st.subheader("3️⃣ تشغيل المعالجة والتدقيق")
 
-    if st.button("🚀 تأكيد القواعد وبدء معالجة الفاتورة", type="primary", use_container_width=True):
+    if st.button(
+        "🚀 بدء تدقيق الفاتورة الآن",
+        type="primary",
+        use_container_width=True,
+    ):
         ext = os.path.splitext(invoice_path)[-1].lower()
-        invoice_df = pd.read_csv(invoice_path) if ext == ".csv" else pd.read_excel(invoice_path)
+        invoice_df = (
+            pd.read_csv(invoice_path)
+            if ext == ".csv"
+            else pd.read_excel(invoice_path)
+        )
 
-        # أ) المسح الأولي للتأكد من سلامة المدخلات
-        validation_file = os.path.join(UPLOAD_DIR, f"Need_Verification_{invoice_file.name}.xlsx")
+        # أ) المسح الأولي للكشف عن المدن والمناطق غير المعرفة
+        validation_file = os.path.join(
+            UPLOAD_DIR, f"Need_Verification_{invoice_file.name}.xlsx"
+        )
         has_issues = scan_and_generate_validation_file(
-            invoice_df, rules, validation_output_path=validation_file
+            invoice_df,
+            st.session_state.contract_rules,
+            validation_output_path=validation_file,
         )
 
         if has_issues:
-            st.error("🛑 توقف مؤقت: يحتوي ملف الفاتورة على مدن أو مناطق مبهمة تحتاج لتوضيح!")
+            st.error(
+                "🛑 توقف مؤقت: ملف الفاتورة يحتوي على مدن أو مناطق مبهمة تحتاج لتوضيح العميل!"
+            )
             with open(validation_file, "rb") as f:
                 st.download_button(
                     label="📥 تحميل ملف التوضيحات المطلوب تعبئته",
@@ -137,40 +304,57 @@ if contract_file and invoice_file:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
         else:
-            # ب) تنفيذ التدقيق النهائي
-            with st.spinner("⚡ [Verilogix Engine] جاري مطابقة الشحنات واحتساب الفروقات المالية..."):
-                flagged_df = audit_invoice_dataframe_fast(invoice_df, rules)
+            # ب) تشغيل المحرك الحسابي الشامل
+            with st.spinner(
+                "⚡ [Verilogix Universal Engine] جاري مطابقة الشحنات واحتساب الفروقات..."
+            ):
+                flagged_df = audit_invoice_dataframe_fast(
+                    invoice_df, st.session_state.contract_rules
+                )
 
                 if flagged_df.empty:
                     st.balloons()
-                    st.success("✅ جميع الشحنات مطابقة للعقد والأسعار تماماً دون وجود أي مخالفات أو فروقات!")
+                    st.success(
+                        "✅ جميع الشحنات مطابقة للعقد تماماً دون وجود أي مخالفات أو فروقات مالية!"
+                    )
                 else:
-                    st.success("🎉 تم التدقيق بنجاح واكتشاف الفروقات المالية القابلة للاسترداد!")
+                    st.success("🎉 تم التدقيق بنجاح واستخراج المخالفات القابلة للاسترداد!")
 
-                    report_path = os.path.join(UPLOAD_DIR, f"Verilogix_Audit_Report_{invoice_file.name}.xlsx")
+                    report_path = os.path.join(
+                        UPLOAD_DIR,
+                        f"Verilogix_Audit_Report_{invoice_file.name}.xlsx",
+                    )
+                    curr = st.session_state.contract_rules.currency
+
                     excel_df = flagged_df.rename(
                         columns={
                             "tracking_id": "رقم الشحنة",
-                            "actual_weight": "الوزن الفعلي",
-                            "volumetric_weight": "الوزن الحجمي",
-                            "chargeable_weight": "الوزن المحسوب",
-                            "billed_amount": f"المبلغ بالفاتورة ({rules.currency})",
-                            "expected_total": f"المبلغ المستحق ({rules.currency})",
-                            "overcharge": f"الزيادة المستردة ({rules.currency})",
+                            "total_actual_weight_kg": "الوزن الفعلي (كجم)",
+                            "total_volumetric_weight_kg": "الوزن الحجمي (كجم)",
+                            "chargeable_weight": "الوزن المحسوب (كجم)",
+                            "billed_amount": f"المبلغ بالفاتورة ({curr})",
+                            "expected_total": f"المبلغ المستحق ({curr})",
+                            "overcharge": f"الزيادة المستردة ({curr})",
                             "dispute_evidence": "تقرير النزاع التلقائي",
                         }
                     )
                     excel_df.to_excel(report_path, index=False)
 
-                    total_recovered = excel_df[f"الزيادة المستردة ({rules.currency})"].sum()
+                    total_recovered = excel_df[f"الزيادة المستردة ({curr})"].sum()
 
                     # عرض البطاقات الرقمية
                     kpi1, kpi2, kpi3 = st.columns(3)
-                    kpi1.metric("إجمالي الأموال القابلة للاسترداد", f"{total_recovered:,.2f} {rules.currency}")
+                    kpi1.metric(
+                        "إجمالي المبالغ المستردة",
+                        f"{total_recovered:,.2f} {curr}",
+                    )
                     kpi2.metric("عدد الشحنات المخالفة", len(excel_df))
-                    kpi3.metric("نسبة المخالفات بالفاتورة", f"{(len(excel_df) / len(invoice_df)) * 100:.1f}%")
+                    kpi3.metric(
+                        "نسبة المخالفات بالفاتورة",
+                        f"{(len(excel_df) / len(invoice_df)) * 100:.1f}%",
+                    )
 
-                    st.subheader("📋 تفاصيل النزاعات والمخالفات المكتشفة:")
+                    st.subheader("📋 جدول النزاعات والمخالفات المكتشفة:")
                     st.dataframe(excel_df, use_container_width=True)
 
                     # زر تحميل التقرير النهائي
@@ -181,4 +365,5 @@ if contract_file and invoice_file:
                             file_name=os.path.basename(report_path),
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
-                        )
+    )
+        
