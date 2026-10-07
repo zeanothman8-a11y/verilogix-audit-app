@@ -1,0 +1,6 @@
+google-genai
+pandas
+openpyxl
+pydantic
+numpy
+streamlit
