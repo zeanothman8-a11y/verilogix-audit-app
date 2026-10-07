@@ -45,7 +45,6 @@ class SurchargeRules(BaseModel):
     )
 
 
-# نموذج متوافق مع Gemini بدلاً من القاموس المباشر لتجنب خطأ Schema
 class CityZoneMapping(BaseModel):
     city: str = Field(description="اسم المدينة أو الرمز البريدي")
     zone_id: str = Field(description="رمز المنطقة المطابق")
@@ -86,7 +85,6 @@ class ContractRules(BaseModel):
     rates: List[RateZone] = Field(description="جدول الشرائح السعرية والمناطق")
     surcharges: SurchargeRules = Field(default_factory=SurchargeRules)
 
-    # خاصية تحويل قائمة المدن إلى قاموس لضمان توافق باقي الكود الحسابي
     @property
     def city_zone_matrix(self) -> Dict[str, str]:
         return {m.city: m.zone_id for m in self.city_zone_mappings}
@@ -125,7 +123,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         c_lower = str(col).strip().lower()
 
-        # أولوية المطابقة
         if any(
             k in c_lower
             for k in [
@@ -221,7 +218,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==========================================
-# 3. الفحص المسبق السريع قبل المعالجة
+# 3. الفحص المسبق السريع والمنظم قبل المعالجة
 # ==========================================
 
 
@@ -230,31 +227,43 @@ def scan_and_generate_validation_file(
     rules: ContractRules,
     validation_output_path: str = "Need_User_Verification.xlsx",
 ) -> bool:
-    """فحص سريع ومعدل الأداء للكشف عن البيانات المبهمة"""
+    """فحص نقي ومحكم للكشف عن البيانات المبهمة دون أخطاء تنسيق"""
     df = normalize_columns(invoice_df.copy())
     valid_zones = {r.zone_id.strip().lower() for r in rules.rates}
+
     matrix_cities = (
-        {k.lower() for k in rules.city_zone_matrix.keys()}
+        {k.lower(): v.lower() for k, v in rules.city_zone_matrix.items()}
         if rules.city_zone_matrix
-        else set()
+        else {}
     )
 
     issues = []
 
-    for idx, row in df.iterrows():
-        tracking = row["tracking_id"]
-        zone = str(row["zone_id"]).strip().lower()
-        city = str(row["destination_city"]).strip().lower()
-        billed = row["billed_amount"]
+    for _, row in df.iterrows():
+        # استخراج صريح ومباشر للنصوص لمنع تشوه الكائنات
+        tracking = str(row["tracking_id"]).strip()
+        zone = str(row["zone_id"]).strip()
+        city = str(row["destination_city"]).strip()
+        billed = float(row["billed_amount"])
 
         reason = []
 
-        if zone not in valid_zones and zone != "default":
-            reason.append(f"المنطقة '{row['zone_id']}' غير معرفة بجدول العقد.")
+        # 1. مطابقة المنطقة بجدول العقد
+        zone_is_valid = (
+            zone.lower() in valid_zones or zone.lower() == "default"
+        )
 
-        if matrix_cities and city and city not in matrix_cities:
-            reason.append(f"المدينة '{row['destination_city']}' غير مسجلة بالماتريكس.")
+        # 2. مطابقة المدينة بالشرائح إذا كانت مصفوفة المدن مفعلة
+        if matrix_cities:
+            city_mapped_zone = matrix_cities.get(city.lower())
+            if not city_mapped_zone and not zone_is_valid:
+                reason.append(
+                    f"المدينة '{city}' والمنطقة '{zone}' غير معرفتين بجدول أسعار العقد."
+                )
+        elif not zone_is_valid:
+            reason.append(f"المنطقة '{zone}' غير معرفة بجدول شرائح العقد.")
 
+        # 3. التحقق من صحة المبلغ
         if billed <= 0:
             reason.append("المبلغ المفلتر بالفاتورة يساوي 0 أو غير صحيح.")
 
@@ -262,8 +271,8 @@ def scan_and_generate_validation_file(
             issues.append(
                 {
                     "رقم الشحنة": tracking,
-                    "المدينة بالمدخلات": row["destination_city"],
-                    "المنطقة بالمدخلات": row["zone_id"],
+                    "المدينة بالمدخلات": city,
+                    "المنطقة بالمدخلات": zone,
                     "المبلغ بالفاتورة": billed,
                     "سبب التوقف والمراجعة": " | ".join(reason),
                     "المنطقة الصحيحة (تعبئة المستخدم)": "",
@@ -334,7 +343,7 @@ def audit_invoice_dataframe_fast(
 ) -> pd.DataFrame:
     df = normalize_columns(invoice_df.copy())
 
-    # أ) تحويل الوحدات القياسية إن وجدت (LBS / INCHES)
+    # أ) تحويل الوحدات القياسية (LBS / INCHES)
     if rules.weight_unit.lower() in ["lb", "lbs", "pound", "باوند"]:
         df["actual_weight_kg"] = df["actual_weight"] * 0.453592
     else:
@@ -345,7 +354,7 @@ def audit_invoice_dataframe_fast(
         df["width_cm"] = df["width_cm"] * 2.54
         df["height_cm"] = df["height_cm"] * 2.54
 
-    # ب) تصحيح حساب الوزن الحجمي للشحنات متعددة الطرود (MPS)
+    # ب) حساب الوزن الحجمي للشحنات متعددة الطرود (MPS)
     vol_divisor = (
         rules.volumetric_divisor if rules.volumetric_divisor > 0 else 5000.0
     )
@@ -353,7 +362,6 @@ def audit_invoice_dataframe_fast(
         df["length_cm"] * df["width_cm"] * df["height_cm"]
     ) / vol_divisor
 
-    # تجميع الأحجام والأوزان بدقة لكل رقم شحنة
     grouped = df.groupby("tracking_id")[
         ["actual_weight_kg", "piece_volumetric_weight_kg"]
     ].transform("sum")
@@ -364,7 +372,7 @@ def audit_invoice_dataframe_fast(
         (df["length_cm"] == 0) & (df["width_cm"] == 0) & (df["height_cm"] == 0)
     )
 
-    # كشف تكرارات الفاتورة الخاطئة
+    # كشف الشحنات المكررة
     df["is_duplicate"] = df.duplicated(
         subset=["tracking_id", "billed_amount"], keep="first"
     ) & ~df["tracking_id"].astype(str).str.startswith("UNKNOWN_")
@@ -388,7 +396,7 @@ def audit_invoice_dataframe_fast(
         df["verified_zone"] = df["zone_id"]
         df["zone_mismatch"] = False
 
-    # د) حساب الوزن الخاضع للرسوم مع تطبيق خطوة التقريب للأعلى (Weight Rounding)
+    # د) حساب الوزن المحسوب وتقريبه للأعلى (Weight Rounding)
     df["raw_chargeable_weight"] = df[
         ["total_actual_weight_kg", "total_volumetric_weight_kg"]
     ].max(axis=1)
@@ -401,7 +409,7 @@ def audit_invoice_dataframe_fast(
     else:
         df["chargeable_weight"] = df["raw_chargeable_weight"]
 
-    # هـ) مطابقة الأسعار بناءً على الشرائح
+    # هـ) مطابقة الأسعار والشرائح
     rates_data = [
         {
             "zone_id": r.zone_id.strip().lower(),
@@ -468,7 +476,7 @@ def audit_invoice_dataframe_fast(
             df["expected_base_price"],
         )
 
-    # ز) احتساب باقي الرسوم والضريبة
+    # ز) احتساب الوقود وCOD والضريبة
     df["expected_fuel_fee"] = (
         df["expected_base_price"] * rules.fuel_surcharge_percentage
     )
@@ -495,7 +503,7 @@ def audit_invoice_dataframe_fast(
 
     df["overcharge"] = (df["billed_amount"] - df["expected_total"]).round(2)
 
-    # ح) فلترة المخالفات بناءً على الحد المعتمد للعملة
+    # ح) فلترة وتقارير المخالفات
     min_thresh = (
         rules.min_overcharge_threshold
         if rules.min_overcharge_threshold > 0
