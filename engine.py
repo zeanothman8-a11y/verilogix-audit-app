@@ -45,6 +45,12 @@ class SurchargeRules(BaseModel):
     )
 
 
+# نموذج متوافق مع Gemini بدلاً من القاموس المباشر لتجنب خطأ Schema
+class CityZoneMapping(BaseModel):
+    city: str = Field(description="اسم المدينة أو الرمز البريدي")
+    zone_id: str = Field(description="رمز المنطقة المطابق")
+
+
 class ContractRules(BaseModel):
     carrier_name: str = Field(description="اسم شركة الشحن العالمية أو المحلية")
     currency: str = Field(
@@ -73,12 +79,17 @@ class ContractRules(BaseModel):
     min_overcharge_threshold: float = Field(
         default=0.5, description="الحد الأدنى لفرق السعر للمطالبة به"
     )
-    city_zone_matrix: Dict[str, str] = Field(
-        default_factory=dict,
-        description="مصفوفة تطابق المدن/الرموز البريدية مع المناطق",
+    city_zone_mappings: List[CityZoneMapping] = Field(
+        default_factory=list,
+        description="قائمة تطابق المدن/الرموز البريدية مع المناطق",
     )
     rates: List[RateZone] = Field(description="جدول الشرائح السعرية والمناطق")
     surcharges: SurchargeRules = Field(default_factory=SurchargeRules)
+
+    # خاصية تحويل قائمة المدن إلى قاموس لضمان توافق باقي الكود الحسابي
+    @property
+    def city_zone_matrix(self) -> Dict[str, str]:
+        return {m.city: m.zone_id for m in self.city_zone_mappings}
 
 
 # ==========================================
@@ -287,7 +298,7 @@ def extract_rules_from_contract(
     3. Fuel Surcharge Percentage.
     4. Volumetric Weight Divisor (e.g. 5000, 6000) and Units (kg/lbs, cm/inches).
     5. Weight Rounding Increment (e.g., 0.5 kg or 1.0 kg rounding steps).
-    6. City/Postal Code to Zone Mapping Matrix if present.
+    6. City/Postal Code to Zone Mapping Matrix if present (as city and zone_id list).
     7. All Rate Zones (Max Weight, Base Price, Extra KG Price).
     8. Surcharges: COD %, Minimum COD fee, Remote Area fee, and Return to Origin (RTO) fee percentage & whether RTO is an add-on fee.
     """
