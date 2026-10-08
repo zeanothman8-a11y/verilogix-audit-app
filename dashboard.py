@@ -270,7 +270,7 @@ if contract_file and invoice_file:
     # 5. تشغيل التدقيق الحسابي بعد التأكيد
     st.subheader("3️⃣ تشغيل المعالجة والتدقيق")
 
-    if st.button(
+       if st.button(
         "🚀 بدء تدقيق الفاتورة الآن",
         type="primary",
         use_container_width=True,
@@ -281,6 +281,27 @@ if contract_file and invoice_file:
             if ext == ".csv"
             else pd.read_excel(invoice_path)
         )
+
+        validation_file = os.path.join(
+            UPLOAD_DIR, f"Need_Verification_{invoice_file.name}.xlsx"
+        )
+        
+        # الفحص المرن الفائق
+        has_issues = scan_and_generate_validation_file(
+            invoice_df,
+            st.session_state.contract_rules,
+            validation_output_path=validation_file,
+            strict_mode=False,
+        )
+
+        if has_issues:
+            st.error("🛑 توقف مؤقت: ملف الفاتورة فارغ أو يحتوي على بيانات غير صحيحة.")
+        else:
+            with st.spinner("⚡ [Verilogix Engine] جاري مطابقة الشحنات واستخراج الفروقات..."):
+                flagged_df = audit_invoice_dataframe_fast(
+                    invoice_df, st.session_state.contract_rules
+                )
+
 
         # أ) المسح الأولي للكشف عن المدن والمناطق غير المعرفة
         validation_file = os.path.join(
