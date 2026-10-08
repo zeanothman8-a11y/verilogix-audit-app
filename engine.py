@@ -50,7 +50,7 @@ class ContractRules(BaseModel):
         return {m.city: m.zone_id for m in self.city_zone_mappings}
 
 # ==========================================
-# 2. تنظيف وتحويل البيانات الذكي
+# 2. تنظيف وتحويل البيانات المحصن
 # ==========================================
 
 def safe_numeric_conversion(series: pd.Series, default_val: float = 0.0) -> pd.Series:
@@ -67,9 +67,16 @@ def safe_numeric_conversion(series: pd.Series, default_val: float = 0.0) -> pd.S
             return float(s) if s != "" else default_val
         except ValueError:
             return default_val
+
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+
     return series.apply(clean_val)
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # إزالة تكرار أسماء الأعمدة في البداية لتفادي خطأ 1-dimensional
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
     col_map = {}
     for col in df.columns:
         c_lower = str(col).strip().lower()
@@ -98,6 +105,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             col_map[col] = "shipment_status"
 
     df = df.rename(columns=col_map)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
 
     numeric_cols = ["actual_weight", "length_cm", "width_cm", "height_cm", "billed_amount", "cod_amount"]
     for n_col in numeric_cols:
@@ -133,12 +141,47 @@ def scan_and_generate_validation_file(
     invoice_df: pd.DataFrame,
     rules: ContractRules,
     validation_output_path: str = "Need_User_Verification.xlsx",
+    strict_mode: bool = False,
 ) -> bool:
     df = normalize_columns(invoice_df.copy())
+    
     if df.empty or "billed_amount" not in df.columns:
         issues_df = pd.DataFrame([{"سبب التوقف": "الملف فارغ أو لا يحتوي على مبالغ شحن مالية."}])
         issues_df.to_excel(validation_output_path, index=False)
         return True
+
+    # النمط الصارم (Strict Mode) ينشط عند الطلب
+    if strict_mode:
+        valid_zones = {r.zone_id.strip().lower() for r in rules.rates}
+        matrix_cities = {k.lower(): v.lower() for k, v in rules.city_zone_matrix.items()} if rules.city_zone_matrix else {}
+        issues = []
+
+        for _, row in df.iterrows():
+            tracking = str(row["tracking_id"]).strip()
+            zone = str(row["zone_id"]).strip()
+            city = str(row["destination_city"]).strip()
+            billed = float(row["billed_amount"])
+            reason = []
+
+            zone_is_valid = zone.lower() in valid_zones or zone.lower() == "default"
+            if matrix_cities and not matrix_cities.get(city.lower()) and not zone_is_valid:
+                reason.append(f"المدينة '{city}' والمنطقة '{zone}' غير معرفتين بجدول العقد.")
+            elif not matrix_cities and not zone_is_valid:
+                reason.append(f"المنطقة '{zone}' غير معرفة بجدول العقد.")
+
+            if reason:
+                issues.append({
+                    "رقم الشحنة": tracking,
+                    "المدينة": city,
+                    "المنطقة": zone,
+                    "المبلغ": billed,
+                    "سبب التوقف": " | ".join(reason),
+                })
+
+        if issues:
+            pd.DataFrame(issues).to_excel(validation_output_path, index=False)
+            return True
+
     return False
 
 # ==========================================
@@ -186,7 +229,7 @@ def extract_rules_from_contract(
         client.files.delete(name=contract_file.name)
 
 # ==========================================
-# 5. المحرك الحسابي والتدقيق الفائق الاحترافي
+# 5. المحرك الحسابي المطور والمحصن بالكامل
 # ==========================================
 
 def audit_invoice_dataframe_fast(
@@ -205,13 +248,17 @@ def audit_invoice_dataframe_fast(
         df["width_cm"] = df["width_cm"] * 2.54
         df["height_cm"] = df["height_cm"] * 2.54
 
-    # ب) حساب الوزن الحجمي
+    # ب) حساب الوزن الحجمي مع حماية التكرار
     vol_divisor = rules.volumetric_divisor if rules.volumetric_divisor > 0 else 5000.0
     df["piece_volumetric_weight_kg"] = (df["length_cm"] * df["width_cm"] * df["height_cm"]) / vol_divisor
 
-    grouped = df.groupby("tracking_id")[["actual_weight_kg", "piece_volumetric_weight_kg"]].transform("sum")
-    df["total_actual_weight_kg"] = grouped["actual_weight_kg"]
-    df["total_volumetric_weight_kg"] = grouped["piece_volumetric_weight_kg"]
+    # استخراج عمود tracking_id كـ Series آمنة لمنع خطأ 1-dimensional
+    tracking_col = df["tracking_id"]
+    if isinstance(tracking_col, pd.DataFrame):
+        tracking_col = tracking_col.iloc[:, 0]
+
+    df["total_actual_weight_kg"] = df.groupby(tracking_col)["actual_weight_kg"].transform("sum")
+    df["total_volumetric_weight_kg"] = df.groupby(tracking_col)["piece_volumetric_weight_kg"].transform("sum")
 
     df["has_zero_dims"] = (df["length_cm"] == 0) & (df["width_cm"] == 0) & (df["height_cm"] == 0)
 
@@ -220,7 +267,7 @@ def audit_invoice_dataframe_fast(
         subset=["tracking_id", "billed_amount"], keep="first"
     ) & ~df["tracking_id"].astype(str).str.startswith("UNKNOWN_")
 
-    # ج) مطابقة المناطق والمدن الذكية (Smart Zone Normalization)
+    # ج) مطابقة المناطق والمدن الذكية
     valid_zones = {r.zone_id.strip().lower() for r in rules.rates}
     default_zone = list(valid_zones)[0] if valid_zones else "standard"
 
@@ -237,7 +284,7 @@ def audit_invoice_dataframe_fast(
         ~df["zone_id"].astype(str).str.strip().str.lower().isin(valid_zones)
     ) & (len(valid_zones) > 1)
 
-    # د) حساب الوزن المحسوب وتقريبه للأعلى (Weight Rounding)
+    # د) حساب الوزن المحسوب وتقريبه للأعلى
     df["raw_chargeable_weight"] = df[["total_actual_weight_kg", "total_volumetric_weight_kg"]].max(axis=1)
 
     if rules.weight_rounding_increment > 0:
