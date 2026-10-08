@@ -74,7 +74,6 @@ def safe_numeric_conversion(series: pd.Series, default_val: float = 0.0) -> pd.S
     return series.apply(clean_val)
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # إزالة تكرار أسماء الأعمدة في البداية لتفادي خطأ 1-dimensional
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
     col_map = {}
@@ -150,7 +149,6 @@ def scan_and_generate_validation_file(
         issues_df.to_excel(validation_output_path, index=False)
         return True
 
-    # النمط الصارم (Strict Mode) ينشط عند الطلب
     if strict_mode:
         valid_zones = {r.zone_id.strip().lower() for r in rules.rates}
         matrix_cities = {k.lower(): v.lower() for k, v in rules.city_zone_matrix.items()} if rules.city_zone_matrix else {}
@@ -229,13 +227,19 @@ def extract_rules_from_contract(
         client.files.delete(name=contract_file.name)
 
 # ==========================================
-# 5. المحرك الحسابي المطور والمحصن بالكامل
+# 5. المحرك الحسابي التدقيقي الصارم والمحكم
 # ==========================================
 
 def audit_invoice_dataframe_fast(
     invoice_df: pd.DataFrame, rules: ContractRules
 ) -> pd.DataFrame:
     df = normalize_columns(invoice_df.copy())
+
+    # كشف التكرار المطابق 100% (Duplicate Billing Detection)
+    df["is_duplicate"] = df.duplicated(
+        subset=["tracking_id", "billed_amount", "actual_weight", "length_cm", "width_cm", "height_cm"],
+        keep="first"
+    ) & ~df["tracking_id"].astype(str).str.startswith("UNKNOWN_")
 
     # أ) تحويل الوحدات القياسية (LBS / INCHES)
     if rules.weight_unit.lower() in ["lb", "lbs", "pound", "باوند"]:
@@ -248,24 +252,26 @@ def audit_invoice_dataframe_fast(
         df["width_cm"] = df["width_cm"] * 2.54
         df["height_cm"] = df["height_cm"] * 2.54
 
-    # ب) حساب الوزن الحجمي مع حماية التكرار
+    # ب) حساب الوزن الحجمي
     vol_divisor = rules.volumetric_divisor if rules.volumetric_divisor > 0 else 5000.0
     df["piece_volumetric_weight_kg"] = (df["length_cm"] * df["width_cm"] * df["height_cm"]) / vol_divisor
 
-    # استخراج عمود tracking_id كـ Series آمنة لمنع خطأ 1-dimensional
-    tracking_col = df["tracking_id"]
+    # تجميع أوزان الطرود للشحنات غير المكررة فقط
+    non_dup_mask = ~df["is_duplicate"]
+    tracking_col = df.loc[non_dup_mask, "tracking_id"]
     if isinstance(tracking_col, pd.DataFrame):
         tracking_col = tracking_col.iloc[:, 0]
 
-    df["total_actual_weight_kg"] = df.groupby(tracking_col)["actual_weight_kg"].transform("sum")
-    df["total_volumetric_weight_kg"] = df.groupby(tracking_col)["piece_volumetric_weight_kg"].transform("sum")
+    grouped_act = df[non_dup_mask].groupby(tracking_col)["actual_weight_kg"].transform("sum")
+    grouped_vol = df[non_dup_mask].groupby(tracking_col)["piece_volumetric_weight_kg"].transform("sum")
+
+    df["total_actual_weight_kg"] = df["actual_weight_kg"]
+    df.loc[non_dup_mask, "total_actual_weight_kg"] = grouped_act
+
+    df["total_volumetric_weight_kg"] = df["piece_volumetric_weight_kg"]
+    df.loc[non_dup_mask, "total_volumetric_weight_kg"] = grouped_vol
 
     df["has_zero_dims"] = (df["length_cm"] == 0) & (df["width_cm"] == 0) & (df["height_cm"] == 0)
-
-    # كشف الشحنات المكررة
-    df["is_duplicate"] = df.duplicated(
-        subset=["tracking_id", "billed_amount"], keep="first"
-    ) & ~df["tracking_id"].astype(str).str.startswith("UNKNOWN_")
 
     # ج) مطابقة المناطق والمدن الذكية
     valid_zones = {r.zone_id.strip().lower() for r in rules.rates}
@@ -362,6 +368,9 @@ def audit_invoice_dataframe_fast(
     df["expected_vat"] = df["expected_subtotal"] * rules.vat_percentage
     df["expected_total"] = (df["expected_subtotal"] + df["expected_vat"]).round(2)
 
+    # معالجة الشحنات المكررة (التكرار الباطل = المستحق 0.0 ريال واسترداد القيمة بالكامل)
+    df.loc[df["is_duplicate"], "expected_total"] = 0.0
+
     df["overcharge"] = (df["billed_amount"] - df["expected_total"]).round(2)
 
     # ح) فلترة وتقارير المخالفات
@@ -377,14 +386,14 @@ def audit_invoice_dataframe_fast(
     def build_evidence(row):
         evidence_list = []
         if row["is_duplicate"]:
-            evidence_list.append(f"تكرار فاتورة لرقم الشحنة {row['tracking_id']}.")
+            evidence_list.append(f"تكرار غير مشروع بالفاتورة لرقم الشحنة {row['tracking_id']}.")
         if row["zone_mismatch"]:
             evidence_list.append(
                 f"اختلاف المنطقة: التسجيل بالفاتورة ({row['zone_id']}) بينما تم تطبيق الشريحة المتاحة بالعقد."
             )
         if row["has_zero_dims"]:
             evidence_list.append("تنبيه: أبعاد الشحنة غير محددة، تم الاحتساب بالوزن الفعلي.")
-        if row["overcharge"] >= min_thresh:
+        if row["overcharge"] >= min_thresh and not row["is_duplicate"]:
             evidence_list.append(
                 f"مبالغة بالأسعار: المفلتر بالفاتورة {row['billed_amount']} {rules.currency} | المستحق بالعقد {row['expected_total']} {rules.currency}. "
                 f"فروقات مستردة: {row['overcharge']} {rules.currency}."
