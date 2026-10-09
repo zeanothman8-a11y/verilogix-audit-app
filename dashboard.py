@@ -298,9 +298,15 @@ if contract_file and invoice_file:
             st.error("🛑 توقف مؤقت: ملف الفاتورة فارغ أو يحتوي على بيانات غير صحيحة.")
         else:
             with st.spinner("⚡ [Verilogix Engine] جاري مطابقة الشحنات واستخراج الفروقات..."):
-                flagged_df = audit_invoice_dataframe_fast(
+                full_audit_df = audit_invoice_dataframe_fast(
                     invoice_df, st.session_state.contract_rules
                 )
+
+                # فلترة الشحنات التي تحتوي على مخالفات/ملاحظات للجدول
+                min_thresh = st.session_state.contract_rules.min_overcharge_threshold
+                flagged_df = full_audit_df[
+                    full_audit_df["dispute_evidence"] != "مطابق للعقد"
+                ].copy()
 
                 if flagged_df.empty:
                     st.balloons()
@@ -308,7 +314,7 @@ if contract_file and invoice_file:
                         "✅ جميع الشحنات مطابقة للعقد تماماً دون وجود أي مخالفات أو فروقات مالية!"
                     )
                 else:
-                    st.success("🎉 تم التدقيق بنجاح واستخراج المخالفات القابلة للاسترداد!")
+                    st.success("🎉 تم التدقيق بنجاح واستخراج تحليل الفروقات الماليّة!")
 
                     report_path = os.path.join(
                         UPLOAD_DIR,
@@ -324,22 +330,35 @@ if contract_file and invoice_file:
                             "chargeable_weight": "الوزن المحسوب (كجم)",
                             "billed_amount": f"المبلغ بالفاتورة ({curr})",
                             "expected_total": f"المبلغ المستحق ({curr})",
-                            "overcharge": f"الزيادة المستردة ({curr})",
+                            "overcharge": f"الفروقات المالية ({curr})",
                             "dispute_evidence": "تقرير النزاع التلقائي",
                         }
                     )
                     excel_df.to_excel(report_path, index=False)
 
-                    total_recovered = excel_df[f"الزيادة المستردة ({curr})"].sum()
+                    # حساب إجمالي الزيادات الصريحة (Gross Overcharges)
+                    gross_overcharges = full_audit_df[
+                        full_audit_df["overcharge"] > 0
+                    ]["overcharge"].sum()
+
+                    # حساب صافي التسوية المالية الاستردادية (Net Settlement)
+                    total_billed = full_audit_df["billed_amount"].sum()
+                    total_expected = full_audit_df["expected_total"].sum()
+                    net_settlement = total_billed - total_expected
 
                     # عرض البطاقات الرقمية
-                    kpi1, kpi2, kpi3 = st.columns(3)
+                    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
                     kpi1.metric(
-                        "إجمالي المبالغ المستردة",
-                        f"{total_recovered:,.2f} {curr}",
+                        "إجمالي الزيادات القابلة للاسترداد (Gross)",
+                        f"{gross_overcharges:,.2f} {curr}",
                     )
-                    kpi2.metric("عدد الشحنات المخالفة", len(excel_df))
-                    kpi3.metric(
+                    kpi2.metric(
+                        "صافي التسوية والاسترداد (Net)",
+                        f"{net_settlement:,.2f} {curr}",
+                        help="الفرق الصافي الكامل بين إجمالي الفاتورة وإجمالي المستحق الفعلي بالعقد بعد المقاصة",
+                    )
+                    kpi3.metric("عدد الشحنات المخالفة", len(excel_df))
+                    kpi4.metric(
                         "نسبة المخالفات بالفاتورة",
                         f"{(len(excel_df) / len(invoice_df)) * 100:.1f}%",
                     )
