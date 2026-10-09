@@ -270,7 +270,7 @@ if contract_file and invoice_file:
     # 5. تشغيل التدقيق الحسابي بعد التأكيد
     st.subheader("3️⃣ تشغيل المعالجة والتدقيق")
 
-       if st.button(
+    if st.button(
         "🚀 بدء تدقيق الفاتورة الآن",
         type="primary",
         use_container_width=True,
@@ -298,37 +298,6 @@ if contract_file and invoice_file:
             st.error("🛑 توقف مؤقت: ملف الفاتورة فارغ أو يحتوي على بيانات غير صحيحة.")
         else:
             with st.spinner("⚡ [Verilogix Engine] جاري مطابقة الشحنات واستخراج الفروقات..."):
-                flagged_df = audit_invoice_dataframe_fast(
-                    invoice_df, st.session_state.contract_rules
-                )
-
-
-        # أ) المسح الأولي للكشف عن المدن والمناطق غير المعرفة
-        validation_file = os.path.join(
-            UPLOAD_DIR, f"Need_Verification_{invoice_file.name}.xlsx"
-        )
-        has_issues = scan_and_generate_validation_file(
-            invoice_df,
-            st.session_state.contract_rules,
-            validation_output_path=validation_file,
-        )
-
-        if has_issues:
-            st.error(
-                "🛑 توقف مؤقت: ملف الفاتورة يحتوي على مدن أو مناطق مبهمة تحتاج لتوضيح العميل!"
-            )
-            with open(validation_file, "rb") as f:
-                st.download_button(
-                    label="📥 تحميل ملف التوضيحات المطلوب تعبئته",
-                    data=f,
-                    file_name=os.path.basename(validation_file),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-        else:
-            # ب) تشغيل المحرك الحسابي الشامل
-            with st.spinner(
-                "⚡ [Verilogix Universal Engine] جاري مطابقة الشحنات واحتساب الفروقات..."
-            ):
                 flagged_df = audit_invoice_dataframe_fast(
                     invoice_df, st.session_state.contract_rules
                 )
@@ -387,4 +356,4 @@ if contract_file and invoice_file:
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
     )
-        
+    
