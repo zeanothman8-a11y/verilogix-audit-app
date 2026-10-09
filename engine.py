@@ -373,15 +373,8 @@ def audit_invoice_dataframe_fast(
 
     df["overcharge"] = (df["billed_amount"] - df["expected_total"]).round(2)
 
-    # ح) فلترة وتقارير المخالفات
+    # ح) بناء أدلة النزاع والتقرير الشامل
     min_thresh = rules.min_overcharge_threshold if rules.min_overcharge_threshold > 0 else 0.1
-
-    flagged = df[
-        (df["overcharge"] >= min_thresh)
-        | (df["is_duplicate"])
-        | (df["zone_mismatch"])
-        | (df["has_zero_dims"])
-    ].copy()
 
     def build_evidence(row):
         evidence_list = []
@@ -398,11 +391,15 @@ def audit_invoice_dataframe_fast(
                 f"مبالغة بالأسعار: المفلتر بالفاتورة {row['billed_amount']} {rules.currency} | المستحق بالعقد {row['expected_total']} {rules.currency}. "
                 f"فروقات مستردة: {row['overcharge']} {rules.currency}."
             )
-        return " | ".join(evidence_list)
+        elif row["overcharge"] < -min_thresh:
+            evidence_list.append(
+                f"تنبيه نقص تحصيل: المفلتر بالفاتورة {row['billed_amount']} {rules.currency} | المستحق بالعقد {row['expected_total']} {rules.currency}."
+            )
+        return " | ".join(evidence_list) if evidence_list else "مطابق للعقد"
 
-    flagged["dispute_evidence"] = flagged.apply(build_evidence, axis=1)
+    df["dispute_evidence"] = df.apply(build_evidence, axis=1)
 
-    return flagged[
+    return df[
         [
             "tracking_id",
             "total_actual_weight_kg",
