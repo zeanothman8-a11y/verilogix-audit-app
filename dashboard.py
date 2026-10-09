@@ -108,6 +108,12 @@ if contract_file and invoice_file:
     )
 
     with st.form("contract_rules_form"):
+        # معالجة ذكية لمنع تكرار مضاعفة النسب المئوية في الواجهة (حماية من تحول 5% إلى 500%)
+        vat_disp = float(rules.vat_percentage * 100) if rules.vat_percentage <= 1.0 else float(rules.vat_percentage)
+        fuel_disp = float(rules.fuel_surcharge_percentage * 100) if rules.fuel_surcharge_percentage <= 1.0 else float(rules.fuel_surcharge_percentage)
+        cod_disp = float(rules.surcharges.cod_fee_percentage * 100) if rules.surcharges.cod_fee_percentage <= 1.0 else float(rules.surcharges.cod_fee_percentage)
+        rto_disp = float(rules.surcharges.rto_fee_percentage * 100) if rules.surcharges.rto_fee_percentage <= 1.0 else float(rules.surcharges.rto_fee_percentage)
+
         # أ) الشروط الأساسية والعملات
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -117,7 +123,7 @@ if contract_file and invoice_file:
             vat_pct = (
                 st.number_input(
                     "نسبة الضريبة VAT %",
-                    value=float(rules.vat_percentage * 100),
+                    value=vat_disp,
                     step=0.5,
                 )
                 / 100.0
@@ -125,7 +131,7 @@ if contract_file and invoice_file:
             fuel_pct = (
                 st.number_input(
                     "نسبة رسوم الوقود %",
-                    value=float(rules.fuel_surcharge_percentage * 100),
+                    value=fuel_disp,
                     step=0.5,
                 )
                 / 100.0
@@ -162,7 +168,7 @@ if contract_file and invoice_file:
             cod_pct = (
                 st.number_input(
                     "نسبة COD %",
-                    value=float(rules.surcharges.cod_fee_percentage * 100),
+                    value=cod_disp,
                     step=0.5,
                 )
                 / 100.0
@@ -183,7 +189,7 @@ if contract_file and invoice_file:
             rto_pct = (
                 st.number_input(
                     "نسبة المرتجع RTO %",
-                    value=float(rules.surcharges.rto_fee_percentage * 100),
+                    value=rto_disp,
                     step=5.0,
                 )
                 / 100.0
@@ -303,7 +309,6 @@ if contract_file and invoice_file:
                 )
 
                 # فلترة الشحنات التي تحتوي على مخالفات/ملاحظات للجدول
-                min_thresh = st.session_state.contract_rules.min_overcharge_threshold
                 flagged_df = full_audit_df[
                     full_audit_df["dispute_evidence"] != "مطابق للعقد"
                 ].copy()
@@ -374,5 +379,5 @@ if contract_file and invoice_file:
                             file_name=os.path.basename(report_path),
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
-    )
+        )
     
